@@ -31,6 +31,8 @@ type Entry struct {
 var ErrUnavailable = errors.New("ledger: unavailable")
 
 type Store interface {
+	Award(ctx context.Context, e Entry, monthlyCap int64) error
+	Reverse(ctx context.Context, paymentID string) (bool, error)
 	HasEntry(ctx context.Context, paymentID string, kind Kind) (bool, error)
 	AwardedInMonth(ctx context.Context, memberID, month string) (int64, error)
 	Append(ctx context.Context, e Entry) error
@@ -67,6 +69,9 @@ func NewMemoryStore(opts ...Option) *MemoryStore {
 }
 
 func (s *MemoryStore) roundTrip(ctx context.Context, op string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.latency > 0 {
 		select {
 		case <-time.After(s.latency):
@@ -78,6 +83,65 @@ func (s *MemoryStore) roundTrip(ctx context.Context, op string) error {
 		return s.faults(op)
 	}
 	return nil
+}
+
+func (s *MemoryStore) Award(ctx context.Context, e Entry, monthlyCap int64) error {
+	if err := s.roundTrip(ctx, "award"); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	var used int64
+	for _, existing := range s.entries {
+		if existing.Kind != KindAward {
+			continue
+		}
+		if existing.PaymentID == e.PaymentID {
+			return nil
+		}
+		if existing.MemberID == e.MemberID && existing.Month == e.Month {
+			used += existing.Points
+		}
+	}
+	e.Kind = KindAward
+	e.Points = min(e.Points, max(monthlyCap-used, 0))
+	s.entries = append(s.entries, e)
+	return nil
+}
+
+func (s *MemoryStore) Reverse(ctx context.Context, paymentID string) (bool, error) {
+	if err := s.roundTrip(ctx, "reverse"); err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	var award Entry
+	found := false
+	for _, e := range s.entries {
+		if e.PaymentID != paymentID {
+			continue
+		}
+		if e.Kind == KindReversal {
+			return true, nil
+		}
+		if e.Kind == KindAward {
+			award = e
+			found = true
+		}
+	}
+	if !found {
+		return false, nil
+	}
+	award.Kind = KindReversal
+	award.Points = -award.Points
+	s.entries = append(s.entries, award)
+	return true, nil
 }
 
 func (s *MemoryStore) HasEntry(ctx context.Context, paymentID string, kind Kind) (bool, error) {
